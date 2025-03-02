@@ -5,4 +5,4 @@ python-dotenv==1.0.0
 pytz==2023.3
 requests==2.31.0
 yt-dlp==2023.11.16
-ffmpeg-python==0.2.0 
+moviepy==1.0.3 

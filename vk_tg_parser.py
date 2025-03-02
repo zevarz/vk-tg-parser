@@ -11,8 +11,11 @@ import shutil
 import vk_api
 import requests
 import argparse
+import threading
 from telegram import Bot
 from telegram.error import TelegramError
+from moviepy.editor import VideoFileClip
+import yt_dlp
 from config import (
     VK_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID,
     VK_GROUPS, POSTING_TIMES, START_DATE, TEMP_DIR, MAX_CACHED_POSTS
@@ -48,6 +51,25 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN)
 # Московский часовой пояс
 moscow_tz = pytz.timezone('Europe/Moscow')
 
+# URL вашего сервиса на Render (заполните после деплоя)
+SERVICE_URL = "https://vk-tg-parser.onrender.com"  # Замените на ваш URL
+
+def keep_alive():
+    """Функция для предотвращения засыпания сервиса на Render.com"""
+    while True:
+        try:
+            requests.get(SERVICE_URL)
+            logger.info("Keeping service alive...")
+        except Exception as e:
+            logger.error(f"Error in keep_alive: {e}")
+        time.sleep(600)  # Запрос каждые 10 минут
+
+# Запускаем функцию в отдельном потоке
+if __name__ == "__main__" and SERVICE_URL != "https://vk-tg-parser.onrender.com":
+    keep_alive_thread = threading.Thread(target=keep_alive)
+    keep_alive_thread.daemon = True
+    keep_alive_thread.start()
+    logger.info("Keep-alive thread started")
 
 def load_published_posts():
     """Загрузка списка уже опубликованных постов"""
@@ -134,49 +156,48 @@ def get_vk_posts_with_videos(group_id, count=100):
 
 
 def download_video(video_url):
-    """Скачивание видео с помощью yt-dlp"""
+    """Скачивание видео с помощью yt-dlp как Python-модуля"""
     try:
         # Создаем временную директорию для видео, если она не существует
         os.makedirs(TEMP_DIR, exist_ok=True)
         
         # Формируем имя для временного файла
         timestamp = int(time.time())
-        output_template = os.path.join(TEMP_DIR, f'video_{timestamp}.%(ext)s')
+        output_path = os.path.join(TEMP_DIR, f'video_{timestamp}.mp4')
         
         logger.info(f"Начинаем скачивание видео: {video_url}")
         
-        # Запускаем yt-dlp для скачивания видео в формате mp4
-        command = [
-            'yt-dlp',
-            '--format', 'best[ext=mp4]/best',  # Предпочитаем mp4, если доступен
-            '--merge-output-format', 'mp4',    # Конвертируем в mp4 при необходимости
-            '--output', output_template,
-            video_url
-        ]
+        # Опции для yt-dlp
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best',
+            'merge_output_format': 'mp4',
+            'outtmpl': output_path,
+            'quiet': False,
+            'no_warnings': False,
+            'ignoreerrors': True,
+        }
         
-        process = subprocess.run(command, capture_output=True, text=True)
-        
-        if process.returncode != 0:
-            logger.error(f"Ошибка при скачивании видео: {process.stderr}")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
+            
+            if os.path.exists(output_path):
+                logger.info(f"Видео успешно скачано: {output_path}")
+                return output_path
+            else:
+                # Проверяем, был ли файл скачан с другим расширением
+                for file in os.listdir(TEMP_DIR):
+                    file_path = os.path.join(TEMP_DIR, file)
+                    if os.path.isfile(file_path) and file.startswith(f'video_{timestamp}'):
+                        logger.info(f"Видео скачано в формате, отличном от mp4: {file_path}")
+                        # Конвертируем в mp4
+                        return convert_to_mp4(file_path)
+                
+                logger.error(f"Не удалось скачать видео: {video_url}")
+                return None
+        except Exception as e:
+            logger.error(f"Ошибка при скачивании видео с yt-dlp: {e}")
             return None
-        
-        # Находим скачанный файл
-        for file in os.listdir(TEMP_DIR):
-            file_path = os.path.join(TEMP_DIR, file)
-            if os.path.isfile(file_path) and file.startswith(f'video_{timestamp}') and file.endswith('.mp4'):
-                logger.info(f"Видео успешно скачано: {file_path}")
-                return file_path
-        
-        # Если не нашли mp4, ищем любой файл, который мог быть скачан
-        for file in os.listdir(TEMP_DIR):
-            file_path = os.path.join(TEMP_DIR, file)
-            if os.path.isfile(file_path) and file.startswith(f'video_{timestamp}'):
-                logger.info(f"Видео скачано в формате, отличном от mp4: {file_path}")
-                # Конвертируем в mp4
-                return convert_to_mp4(file_path)
-        
-        logger.error("Не удалось найти скачанный файл")
-        return None
     
     except Exception as e:
         logger.error(f"Ошибка при скачивании видео: {e}")
@@ -184,126 +205,148 @@ def download_video(video_url):
 
 
 def convert_to_mp4(video_path):
-    """Конвертация видео в формат MP4"""
+    """Конвертирует видео в формат MP4 с помощью moviepy"""
     try:
-        # Проверяем, что файл существует
         if not os.path.exists(video_path):
-            logger.error(f"Файл для конвертации не существует: {video_path}")
+            logger.error(f"Файл не существует: {video_path}")
             return None
         
-        # Если файл уже в формате mp4, возвращаем его
+        # Проверяем, является ли файл уже MP4
         if video_path.lower().endswith('.mp4'):
+            logger.info("Файл уже в формате MP4")
             return video_path
         
-        logger.info(f"Конвертация видео в формат MP4: {video_path}")
+        # Путь для конвертированного видео
+        mp4_path = os.path.splitext(video_path)[0] + ".mp4"
         
-        # Формируем имя для выходного файла
-        filename, _ = os.path.splitext(video_path)
-        output_path = f"{filename}.mp4"
-        
-        # Проверяем наличие ffmpeg
         try:
-            subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
-        except FileNotFoundError:
-            logger.error("ffmpeg не установлен. Установите его для конвертации видео.")
-            return video_path
-        
-        # Формируем команду для ffmpeg
-        command = [
-            'ffmpeg',
-            '-i', video_path,
-            '-c:v', 'libx264',
-            '-c:a', 'aac',
-            '-y',  # Перезаписывать файл, если он существует
-            output_path
-        ]
-        
-        # Запускаем ffmpeg для конвертации видео
-        process = subprocess.run(command, capture_output=True, text=True)
-        
-        if process.returncode != 0:
-            logger.error(f"Ошибка при конвертации видео: {process.stderr}")
-            return video_path
-        
-        # Удаляем исходный файл
-        try:
-            os.remove(video_path)
+            # Открываем видео с помощью moviepy
+            clip = VideoFileClip(video_path)
+            
+            # Конвертируем в MP4
+            clip.write_videofile(
+                mp4_path,
+                codec='libx264',
+                audio_codec='aac',
+                preset='medium',
+                threads=2
+            )
+            
+            # Закрываем клип для освобождения ресурсов
+            clip.close()
+            
+            logger.info(f"Видео успешно конвертировано в MP4: {mp4_path}")
+            
+            # Удаляем исходный файл
+            try:
+                os.remove(video_path)
+            except Exception as e:
+                logger.warning(f"Не удалось удалить исходный файл после конвертации: {e}")
+            
+            return mp4_path
         except Exception as e:
-            logger.warning(f"Не удалось удалить исходный файл после конвертации: {e}")
-        
-        logger.info(f"Видео успешно конвертировано в MP4: {output_path}")
-        return output_path
-    
+            logger.error(f"Ошибка при конвертации видео в MP4 с moviepy: {e}")
+            return video_path
     except Exception as e:
         logger.error(f"Ошибка при конвертации видео в MP4: {e}")
         return video_path
 
 
 def compress_video(video_path):
-    """Сжатие видео с помощью ffmpeg для уменьшения размера"""
+    """Сжимает видео с помощью moviepy для уменьшения размера"""
     try:
-        # Проверяем размер исходного файла
-        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+        if not os.path.exists(video_path):
+            logger.error(f"Файл не существует: {video_path}")
+            return None
         
-        # Если размер меньше максимального, сжатие не требуется
-        if file_size_mb <= MAX_VIDEO_SIZE_MB:
-            logger.info(f"Видео не требует сжатия (размер: {file_size_mb:.2f} МБ)")
-            
-            # Проверяем формат и конвертируем в mp4 при необходимости
-            if not video_path.lower().endswith('.mp4'):
-                return convert_to_mp4(video_path)
-            
+        # Проверяем, нужно ли конвертировать видео в MP4
+        if not video_path.lower().endswith('.mp4'):
+            video_path = convert_to_mp4(video_path)
+            if not video_path:
+                logger.error("Не удалось конвертировать видео в MP4")
+                return None
+        
+        # Получаем размер файла в МБ
+        file_size = os.path.getsize(video_path) / (1024 * 1024)
+        logger.info(f"Размер исходного файла: {file_size:.2f} МБ")
+        
+        # Если размер меньше 50 МБ, сжатие не требуется
+        if file_size < MAX_VIDEO_SIZE_MB:
+            logger.info("Размер файла меньше максимального, сжатие не требуется")
             return video_path
         
-        logger.info(f"Начинаем сжатие видео (исходный размер: {file_size_mb:.2f} МБ)")
+        # Путь для сжатого видео
+        compressed_path = os.path.join(os.path.dirname(video_path), "compressed_video.mp4")
         
-        # Формируем имя для сжатого файла
-        filename, _ = os.path.splitext(video_path)
-        compressed_path = f"{filename}_compressed.mp4"  # Всегда сохраняем в mp4
-        
-        # Проверяем наличие ffmpeg
         try:
-            subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
-        except FileNotFoundError:
-            logger.error("ffmpeg не установлен. Установите его для сжатия видео.")
+            # Открываем видео с помощью moviepy
+            clip = VideoFileClip(video_path)
+            
+            # Определяем битрейт в зависимости от размера файла
+            if file_size > 200:
+                target_bitrate = "1000k"
+            elif file_size > 100:
+                target_bitrate = "1500k"
+            else:
+                target_bitrate = "2000k"
+            
+            # Сжимаем видео
+            clip.write_videofile(
+                compressed_path,
+                codec='libx264',
+                bitrate=target_bitrate,
+                audio_codec='aac',
+                audio_bitrate='128k',
+                preset='medium',
+                threads=2
+            )
+            
+            # Закрываем клип для освобождения ресурсов
+            clip.close()
+            
+            # Проверяем размер сжатого файла
+            compressed_size = os.path.getsize(compressed_path) / (1024 * 1024)
+            logger.info(f"Размер сжатого файла: {compressed_size:.2f} МБ")
+            
+            # Если сжатие не помогло, возвращаем исходный файл
+            if compressed_size >= file_size:
+                logger.warning("Сжатие не уменьшило размер файла, возвращаем исходный")
+                os.remove(compressed_path)
+                return video_path
+            
+            # Если размер все еще больше максимального, пробуем сжать сильнее
+            if compressed_size > MAX_VIDEO_SIZE_MB:
+                logger.warning(f"Файл все еще слишком большой ({compressed_size:.2f} МБ), пробуем сжать сильнее")
+                os.remove(compressed_path)
+                
+                # Открываем видео снова
+                clip = VideoFileClip(video_path)
+                
+                # Уменьшаем разрешение на 50%
+                clip_resized = clip.resize(0.5)
+                
+                # Сжимаем с более низким битрейтом
+                clip_resized.write_videofile(
+                    compressed_path,
+                    codec='libx264',
+                    bitrate="800k",
+                    audio_codec='aac',
+                    audio_bitrate='96k',
+                    preset='medium',
+                    threads=2
+                )
+                
+                # Закрываем клипы
+                clip.close()
+                clip_resized.close()
+                
+                compressed_size = os.path.getsize(compressed_path) / (1024 * 1024)
+                logger.info(f"Размер файла после сильного сжатия: {compressed_size:.2f} МБ")
+            
+            return compressed_path
+        except Exception as e:
+            logger.error(f"Ошибка при сжатии видео с moviepy: {e}")
             return video_path
-        
-        # Определяем битрейт в зависимости от размера файла
-        target_bitrate = int(8000 * MAX_VIDEO_SIZE_MB / file_size_mb)  # кбит/с
-        target_bitrate = min(max(target_bitrate, 500), 2000)  # ограничиваем от 500 до 2000 кбит/с
-        
-        # Формируем команду для ffmpeg
-        command = [
-            'ffmpeg',
-            '-i', video_path,
-            '-c:v', 'libx264',
-            '-b:v', f'{target_bitrate}k',
-            '-preset', 'fast',
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-y',  # Перезаписывать файл, если он существует
-            compressed_path
-        ]
-        
-        # Запускаем ffmpeg для сжатия видео
-        process = subprocess.run(command, capture_output=True, text=True)
-        
-        if process.returncode != 0:
-            logger.error(f"Ошибка при сжатии видео: {process.stderr}")
-            return video_path
-        
-        # Проверяем размер сжатого файла
-        compressed_size_mb = os.path.getsize(compressed_path) / (1024 * 1024)
-        logger.info(f"Видео успешно сжато (новый размер: {compressed_size_mb:.2f} МБ)")
-        
-        # Если сжатие не помогло, возвращаем исходный файл
-        if compressed_size_mb > MAX_VIDEO_SIZE_MB:
-            logger.warning(f"Сжатие не помогло уменьшить размер ниже {MAX_VIDEO_SIZE_MB} МБ")
-            os.remove(compressed_path)
-            return video_path
-        
-        return compressed_path
-    
     except Exception as e:
         logger.error(f"Ошибка при сжатии видео: {e}")
         return video_path
